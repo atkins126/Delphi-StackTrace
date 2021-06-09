@@ -17,6 +17,16 @@ Tested with:
 - Delphi 2009
 - Delphi 10.1.2 Berlin: 32bit and 64bit
 
+To use it:
+- Include the Stacktrace unit, by manually adding it to the top of the uses list in the dpr file.
+- Compile all source files with {$StackFrames on}. It is not strictly required but gives better stacktraces.
+- In the Delphi Project options, under "Linking", set "Map File" to "Detailed".
+- Under "Build Events", "Post-Build", add this command:
+		map2pdb.exe  "-include:0001;0002"  "$(OUTPUTDIR)\$(OUTPUTNAME).map"
+
+  You may want to use map2pdb with additional filters, as the PDBs gets very large, especially on 64bit.
+- Ship the PDB files together with the EXEs and DLLs, by putting them in the same directory.
+
 Please note:
 As the Delphi runtime library handles things not consistently and contains bugs (see some of the comments in the code),
 I don't know if this works with other Delphi versions as well. Please use a memory leak detector to verify the behavior.
@@ -28,4 +38,5 @@ The 32bit compiler and RTL makes it nearly impossible to get the stacktrace from
 For some reason, the original exception object is released by the RTL and then a new one is created, but we still need the
 stackinfo from the original object which is now gone. It is not possible to recreate it. So for now, I just reattach the
 very last stackinfo, but depending on other exceptions thrown and catched between the original point and the reraise point,
-it may be no longer the correct one.
+it may be no longer the correct one. But: When AcquireExceptionObject is used, reraising works also in 32bit for every type
+of exception.

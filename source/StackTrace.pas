@@ -8,6 +8,22 @@ unit StackTrace;
   Anders Melander's map2pdb.exe can be used for this:
 	https://bitbucket.org/anders_melander/map2pdb/src/master/
 
+  Notes:
+
+  As the Delphi runtime library handles things not consistently and contains bugs (see some of the comments in the code),
+  I don't know if this works with other Delphi versions as well. Please use a memory leak detector to verify the behavior.
+
+  Generally, the 64bit compiler and RTL fixes a few things, as exception reraising now always reuses the original exception
+  object and it also generates source-line infos for the main part of the dpr file (the lines between "begin" and "end.").
+
+  The 32bit compiler and RTL makes it nearly impossible to get the stacktrace from an non-delphi exception that is reraised:
+  For some reason, the original exception object is released by the RTL and then a new one is created, but we still need the
+  stackinfo from the original object which is now gone. It is not possible to recreate it. So for now, I just reattach the
+  very last stackinfo, but depending on other exceptions thrown and catched between the original point and the reraise point,
+  it may be no longer the correct one.
+
+  To get notifications on DLL unloading, the Windows function LdrRegisterDllNotification is used, which  may change on
+  later Windows releases (unlikely). But there is no alternative.
 }
 
 {$include LibOptions.inc}
@@ -47,14 +63,21 @@ type
 	  FProcess = THandle(-1);	// = Windows.GetCurrentProcess
 	  FThread = THandle(-2);	// = Windows.GetCurrentThread
 	class var
-	  FInitDone: boolean;
-	  FLock: TSlimRWLock;
+	  FLock: TSlimRWLock;		// lock around all DbgHelp functions
+	  FHandlerCookie: pointer;	// LdrRegisterDllNotification handle
+	  FInitDone: boolean;		// state of DbgHelp regarding SymInitialize
+	  FDoReinit: boolean;		// set to true when a DLL was unloaded
 
-	class procedure InitDbgHelp; static;
+	class procedure InitSyms; static;
 	class function ProcessFrame(VirtualAddr: TAddr): TFrameInfo; static;
 	class function GetModuleFilename(hModule: HINST): string; static;
+
+	class function GetFuncPtr(FuncName: PAnsiChar): pointer; static;
+	class procedure OsDllNotification(Reason: ULONG; Data: pointer; Context: pointer); stdcall; static;
   private
-	//class procedure FiniDbgHelp; static;
+	class procedure Init; static;
+	class procedure Fini; static;
+	class procedure FiniSyms; static;
 	class procedure DoSetupContext(var Ctx: CONTEXT); static;
 	class function DoGetStackTrace(var Ctx: CONTEXT; SkipFrames: uint32; out Addrs: array of TAddr): uint32; static;
 	class function InterpretStackTrace(const Addrs: array of TAddr; Count: uint32): string; static;
@@ -70,9 +93,6 @@ implementation
 uses
   Types,
   SysUtils;
-
-const
-  CrLf = #13#10;
 
 type
   TAddr = TStackTraceHlp.TAddr;
@@ -175,21 +195,55 @@ end;
 function TStackTraceHlp.TFrameInfo.ToString: string;
 begin
   if self.SrcLineNo = 0  then
-	Result := SysUtils.Format('  %s%s' + CrLf, [self.ModuleName, self.FuncName])
+	Result := SysUtils.Format('%s%s', [self.ModuleName, self.FuncName])
   else
-	Result := SysUtils.Format('  %s%s in %s (Line %u)' + CrLf, [self.ModuleName, self.FuncName, self.SrcFilename, self.SrcLineNo]);
+	Result := SysUtils.Format('%s%s in %s (Line %u)', [self.ModuleName, self.FuncName, self.SrcFilename, self.SrcLineNo]);
 end;
 
 
 { TStackTraceHlp }
 
  //===================================================================================================================
+ // Setup for getting stack traces on Delphi exceptions.
+ //===================================================================================================================
+class procedure TStackTraceHlp.Init;
+var
+  RegisterFunc: TLdrRegisterDllNotification;
+begin
+  // registering to get DLL unload notifications (may not work in future Windows versions, but there is nothing else!):
+  RegisterFunc := self.GetFuncPtr('LdrRegisterDllNotification');
+  if Assigned(RegisterFunc) then
+	MyAssert(RegisterFunc(0, self.OsDllNotification, nil, FHandlerCookie) = STATUS_SUCCESS);
+end;
+
+
+ //===================================================================================================================
+ // Teardown for getting stack traces on Delphi exceptions.
+ //===================================================================================================================
+class procedure TStackTraceHlp.Fini;
+var
+  UnregisterFunc: TLdrUnregisterDllNotification;
+begin
+  if Assigned(FHandlerCookie) then begin
+	UnregisterFunc := self.GetFuncPtr('LdrUnregisterDllNotification');
+	MyAssert(UnregisterFunc(FHandlerCookie) = STATUS_SUCCESS);
+  end;
+end;
+
+
+ //===================================================================================================================
  // Initializes the DbgHelp DLL for this process.
  // Must run in lock, as DbgHelp functions are not thread-safe.
  // Does not throw exceptions.
  //===================================================================================================================
-class procedure TStackTraceHlp.InitDbgHelp;
+class procedure TStackTraceHlp.InitSyms;
 begin
+  // address space of an unloaded DLL may be reused (e.g. dynamic plug-ins) => reinitialize DbgHelp's symbol cache:
+  if FDoReinit then begin
+	FDoReinit := false;
+	self.FiniSyms;
+  end;
+
   // A process that calls SymInitialize should not call it again unless it calls SymCleanup first.
   if not FInitDone then begin
 	// Needs "symsrv.dll": 'srv*c:\WindowsSymbols*https://msdl.microsoft.com/download/symbols'
@@ -200,19 +254,38 @@ begin
 end;
 
 
-{
  //===================================================================================================================
  // Must run in lock, as DbgHelp functions are not thread-safe.
  // Does not throw exceptions.
  //===================================================================================================================
-class procedure TStackTraceHlp.FiniDbgHelp;
+class procedure TStackTraceHlp.FiniSyms;
 begin
   if FInitDone then begin
 	FInitDone := false;
 	MyAssert(DbgHelp.SymCleanup(FProcess));
   end;
 end;
-}
+
+
+ //===================================================================================================================
+ // Get pointer of function in ntdll.dll. Returns nil if unavaiable.
+ //===================================================================================================================
+class function TStackTraceHlp.GetFuncPtr(FuncName: PAnsiChar): pointer;
+begin
+  Result := Windows.GetProcAddress(Windows.LoadLibrary('ntdll.dll'), FuncName);
+  Assert(Assigned(Result));
+end;
+
+
+ //===================================================================================================================
+ // Is called on loading and unloading of DLLs in the process. DLL unloading can occur at the very same time some thread
+ // is taking a stack trace, but this thread should not have addresses of an unloading/unloaded DLL in its call stack.
+ //===================================================================================================================
+class procedure TStackTraceHlp.OsDllNotification(Reason: ULONG; Data: pointer; Context: pointer);
+begin
+  if Reason = LDR_DLL_NOTIFICATION_REASON_UNLOADED then
+	FDoReinit := true;
+end;
 
 
  //===================================================================================================================
@@ -246,7 +319,7 @@ begin
   FLock.AcquireExclusive;
   try
 
-	self.InitDbgHelp;
+	self.InitSyms;
 
 	ZeroMem(Frame, sizeof(Frame));
 	Frame.AddrPC.Mode    := AddrModeFlat;
@@ -290,8 +363,9 @@ var
   Symbol: record
 	case byte of
 	0: (s: DbgHelp.SYMBOL_INFO);
-	1: (b: array [0..sizeof(SYMBOL_INFO) - 2 + MaxSymbolLen * sizeof(WideChar)] of byte);
+	1: (b: array [0..sizeof(SYMBOL_INFO) - sizeof(char) + MaxSymbolLen * sizeof(char)] of byte);
   end;
+  HaveSymbol: boolean;
   Line: IMAGEHLP_LINE64;
 begin
   Assert(FInitDone);
@@ -307,15 +381,20 @@ begin
   FLock.AcquireExclusive;
   try
 
-	if not DbgHelp.SymFromAddr(FProcess, VirtualAddr, SymOffset, Symbol.s) then begin
+	HaveSymbol := DbgHelp.SymFromAddr(FProcess, VirtualAddr, SymOffset, Symbol.s);
+
+	if not HaveSymbol or (Symbol.s.ModBase = 0) then
+	  Symbol.s.ModBase := DbgHelp.SymGetModuleBase64(FProcess, VirtualAddr);
+
+	if Symbol.s.ModBase <> 0 then
+	  Result.ModuleName := SysUtils.ExtractFilename(self.GetModuleFilename(HINST(Symbol.s.ModBase))) + ': ';
+
+	if not HaveSymbol then begin
 	  Result.FuncName := '0x' + SysUtils.IntToHex(VirtualAddr, 2 * sizeof(pointer));;
 	  exit;
 	end;
 
 	SetString(Result.FuncName, Symbol.s.Name, Symbol.s.NameLen);
-
-	if Symbol.s.ModBase <> 0 then
-	  Result.ModuleName := SysUtils.ExtractFilename(self.GetModuleFilename(HINST(Symbol.s.ModBase))) + ': ';
 
 	ZeroMem(Line, sizeof(Line));
 	Line.SizeOfStruct := sizeof(Line);
@@ -344,7 +423,8 @@ var
 begin
   Result := '';
   for i := 0 to int32(Count) - 1 do begin
-	Result := Result + self.ProcessFrame(Addrs[i]).ToString;
+	if i <> 0 then Result := Result + #13#10;
+	Result := Result + '  at ' + self.ProcessFrame(Addrs[i]).ToString;
   end;
 end;
 
@@ -388,7 +468,6 @@ end;
  //===================================================================================================================
  // For usage by application code, outside of the internal Delphi or Windows exception handling.
  //===================================================================================================================
-{$StackFrames on}
 class function TStackTraceHlp.GetStackTrace: string;
 var
   Ctx: DbgHelp.CONTEXT;
@@ -400,7 +479,6 @@ begin
   Count := self.DoGetStackTrace(Ctx, 1, Addrs);
   Result := self.InterpretStackTrace(Addrs, Count);
 end;
-{$StackFrames off}
 
 
 type
@@ -421,13 +499,6 @@ type
 
 	class var
 	  FHandlerHandle: pointer;
-	  {$ifdef Win64}
-	  FOriginalRaiseExceptObjProc: procedure(P: PExceptionRecord);
-	  {$endif}
-
-	{$ifdef Win64}
-	class procedure RaiseExceptObject(P: PExceptionRecord); static;
-	{$endif}
 
 	class function OsExceptionHandler(Info: PEXCEPTION_POINTERS): LONG; stdcall; static;
 
@@ -459,6 +530,7 @@ threadvar
 { TExceptionHelp }
 
  //===================================================================================================================
+ // Setup for getting stack traces on Delphi exceptions.
  //===================================================================================================================
 class procedure TExceptionHelp.Init;
 begin
@@ -469,45 +541,20 @@ begin
   // hook into Windows exception handling:
   FHandlerHandle := DbgHelp.AddVectoredExceptionHandler(1, OsExceptionHandler);
   Assert(FHandlerHandle <> nil);
-
-  {$ifdef Win64}
-  FOriginalRaiseExceptObjProc := System.RaiseExceptObjProc;
-  System.RaiseExceptObjProc := @self.RaiseExceptObject;
-  {$endif}
 end;
 
 
  //===================================================================================================================
+ // Teardown for getting stack traces on Delphi exceptions.
  //===================================================================================================================
 class procedure TExceptionHelp.Fini;
 begin
-  {$ifdef Win64}
-  System.TRaiseExceptObjProc(System.RaiseExceptObjProc) := FOriginalRaiseExceptObjProc;
-  {$endif}
-
   MyAssert(DbgHelp.RemoveVectoredExceptionHandler(FHandlerHandle) <> 0);
 
   SysUtils.Exception.GetExceptionStackInfoProc := nil;
   //  Release should remain possible: SysUtils.Exception.CleanupStackInfoProc not cleared
   SysUtils.Exception.GetStackInfoStringProc := nil;
 end;
-
-
-{$ifdef Win64}
- //===================================================================================================================
- // Need to work around this bug in System.Exception.RaisingException:
- //  GetExceptionStackInfoProc is called even when the exception already contains StackInfos from its original creation
- //  => This destroys the original infos as also leads to a memory leak as CleanupStackInfoProc is not called for the
- //  overwritten StackInfo pointer.
- //===================================================================================================================
-class procedure TExceptionHelp.RaiseExceptObject(P: PExceptionRecord);
-begin
-  // Delphi 10.1 + Win64: Prevent memory leak, as also preserve the StackInfo from the original exception, by not
-  // overwriting the already existing StackInfo object in the reraised exception object.
-  if (TObject(P.ExceptObject) is Exception) and (Exception(P.ExceptObject).StackInfo = nil) and Assigned(FOriginalRaiseExceptObjProc) then
-	FOriginalRaiseExceptObjProc(P);
-end;
-{$endif}
 
 
  //===================================================================================================================
@@ -548,7 +595,7 @@ end;
  //
  // Win32: Reraise of non-Delphi exceptions:
  // Idiotically, the RTL releases the original execption objekt and therefore the attached StackInfo (System.pas,
- //  _RaiseAgain, Zeile 12524), instead of keeping and resuing it!
+ //  _RaiseAgain, line 12524), instead of keeping and resuing it!
  // The CPU stack and gOsExceptCtx are outdated and therefore unusable at this point => We only can reuse the last
  // stackinfo generated for the address, which is not 100% reliable...
  //
@@ -564,6 +611,13 @@ var
   Ctx: DbgHelp.CONTEXT;
   SkipFrames: integer;
 begin
+  if TObject(p.ExceptObject) is EAbort then exit(nil);
+
+  // Delphi 10.1 + Win64: Prevent memory leak, as also preserve the StackInfo from the original exception, by not
+  // overwriting an already existing StackInfo object in the reraised exception object.
+  if (TObject(P.ExceptObject) is Exception) and (Exception(P.ExceptObject).StackInfo <> nil) then
+	exit(Exception(P.ExceptObject).StackInfo);
+
   if p.ExceptionCode = cDelphiException then begin
 	// initial handling of a Delphi exception: System._RaiseExcept: Creates the Exception object, before
 	// Windows.RaiseException is called => must construct a suitable Context:
@@ -593,6 +647,13 @@ var
   OsCtx: ^TOsExceptCtx;
   Ctx: DbgHelp.CONTEXT;
 begin
+  if TObject(p.ExceptObject) is EAbort then exit(nil);
+
+  // case "raise System.AcquireExceptionObject": Prevent memory leak, as also preserve the StackInfo from the original
+  // exception, by not overwriting an already existing StackInfo object in the reraised exception object.
+  if (TObject(P.ExceptObject) is Exception) and (Exception(P.ExceptObject).StackInfo <> nil) then
+	exit(Exception(P.ExceptObject).StackInfo);
+
   OsCtx := @gOsExceptCtx;
 
   if p.ExceptionCode = cDelphiException then begin
@@ -602,9 +663,9 @@ begin
 	// System.pas, procedure _RaiseExcept, puts the registers of the exception point as 7 arguments into ExceptionInformation:
 	Assert(p.NumberParameters = 7);
 	Ctx.ContextFlags := CONTEXT_CONTROL;
-	Ctx.IP := DWORD(p.ExceptionAddress);
-	Ctx.SP := DWORD(p.ExceptionInformation[6]);
-	Ctx.BP := DWORD(p.ExceptionInformation[5]);
+	Ctx.IP := TAddr(p.ExceptionAddress);
+	Ctx.SP := TAddr(p.ExceptionInformation[6]);
+	Ctx.BP := TAddr(p.ExceptionInformation[5]);
   end
   else if OsCtx.ValidCtx then begin
 	// initial handling of a non-Delphi exception: OsCtx contains the data captured immediately before:
@@ -614,13 +675,15 @@ begin
 	Ctx.SP := OsCtx.SP;
 	Ctx.BP := OsCtx.BP;
   end
-  else if OsCtx.IP = DWORD_PTR(p.ExceptionAddress) then begin
+  else if OsCtx.IP = TAddr(p.ExceptionAddress) then begin
 	// reraise of a non-Delphi exception: OsCtx does not match the current CPU stack, which no longer covers the original
 	// point of exception => can only reuse the last stackinfo (hopefully still the right one):
 	System.GetMem(Result, sizeof(TFrames));
 	PFrames(Result)^ := OsCtx.Stack;
 	exit;
-  end;
+  end
+  else
+	exit(nil);
 
   System.GetMem(Result, sizeof(TFrames));
   PFrames(Result).Count := TStackTraceHlp.DoGetStackTrace(Ctx, 0, PFrames(Result).Addrs);
@@ -639,9 +702,9 @@ end;
  //===================================================================================================================
 class procedure TExceptionHelp.CleanupStackInfo(Info: Pointer);
 begin
-  // Bug since Delphi 2009: SysUtils.pas, Zeile 17891, DoneExceptions:
-  //   InvalidPointer.*Free* müßte *FreeInstance* sein (wie vorher bei OutOfMemory.FreeInstance)
-  // => wird auch für das statische Exception-Objekt InvalidPointer gerufen:
+  // Bug since Delphi 2009: SysUtils.pas, line 17891, DoneExceptions:
+  //   InvalidPointer.*Free* should be *FreeInstance* (as a few lines before with OutOfMemory.FreeInstance)
+  // => CleanupStackInfo is also called for the shared "InvalidPointer" object which has no StackInfo
   System.FreeMem(Info);
 end;
 
@@ -659,8 +722,9 @@ end;
 
 
 initialization
+  TStackTraceHlp.Init;
   TExceptionHelp.Init;
 finalization
   TExceptionHelp.Fini;
+  TStackTraceHlp.Fini;
 end.
-

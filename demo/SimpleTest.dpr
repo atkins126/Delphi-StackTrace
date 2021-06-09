@@ -2,11 +2,17 @@ program SimpleTest;
 
 {$include CompilerOptions.inc}
 
+{$AppType Console}
+
+{$R *.res}
+
 uses
+  //WinMemMgr,
+  //MemTest,
+  //CorrectLocale,
+  Stacktrace,
   Windows,
-  StdLib,
-  SysUtils,
-  Stacktrace;
+  SysUtils;
 
 // IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE = $8000: Terminal server aware
 // IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE = $40: Address Space Layout Randomization (ASLR) enabled
@@ -36,6 +42,8 @@ end;
  //===================================================================================================================
  //===================================================================================================================
 procedure TestDelpiException;
+var
+  AcquiredException: TObject;
 begin
   Something;
   try
@@ -51,7 +59,7 @@ begin
 	Something;
   except
 	on e: Exception do begin
-	  Writeln(e.Message, ': Exception "', e.ClassName, '" at');
+	  Writeln(e.Message, ': Exception "', e.ClassName, '"');
 	  Writeln(e.StackTrace);
 
 	  try
@@ -59,11 +67,24 @@ begin
 
 		try
 		  Something;
+
 		  try
-			raise Exception.Create('Exception #2');
+
+			try
+			  raise Exception.Create('Exception #2');
+			except
+			  // test situation when AcquireExceptionObject is used:
+			  AcquiredException := System.AcquireExceptionObject;
+			end;
+
+			Something;
+			// reraise the catched exception:
+			raise AcquiredException;
+
 		  finally
 			Something;
 		  end;
+
 		  Something;
 		except
 		  raise;
@@ -72,7 +93,7 @@ begin
 		Something;
 	  except
 		on e: Exception do begin
-		  Writeln(e.Message, ': Exception "', e.ClassName, '" at');
+		  Writeln(e.Message, ': Exception "', e.ClassName, '"');
 		  Writeln(e.StackTrace);
 		end;
 	  end;
@@ -88,6 +109,8 @@ end;
  //===================================================================================================================
  //===================================================================================================================
 procedure TestOsException;
+var
+  AcquiredException: TObject;
 begin
   Something;
   try
@@ -103,7 +126,7 @@ begin
 	Something;
   except
 	on e: Exception do begin
-	  Writeln(e.Message, ': Exception "', e.ClassName, '" at');
+	  Writeln(e.Message, ': Exception "', e.ClassName, '"');
 	  Writeln(e.StackTrace);
 
 	  try
@@ -111,11 +134,26 @@ begin
 
 		try
 		  Something;
+
 		  try
-			Writeln(1 div GetZero);	// force exception
+			// Compiler cannot know that the division always throws an exception:
+			AcquiredException := nil;
+
+			try
+			  Writeln(1 div GetZero);	// force exception
+			except
+			  // test situation when AcquireExceptionObject is used:
+			  AcquiredException := System.AcquireExceptionObject;
+			end;
+
+			Something;
+			// reraise the catched exception:
+			raise AcquiredException;
+
 		  finally
 			Something;
 		  end;
+
 		  Something;
 		except
 		  raise;
@@ -124,7 +162,7 @@ begin
 		Something;
 	  except
 		on e: Exception do begin
-		  Writeln(e.Message, ': Exception "', e.ClassName, '" at');
+		  Writeln(e.Message, ': Exception "', e.ClassName, '"');
 		  Writeln(e.StackTrace);
 		end;
 	  end;
@@ -140,24 +178,20 @@ end;
  //===================================================================================================================
  //===================================================================================================================
 procedure Test2;
+var
+  hMod: HMODULE;
 begin
-(*
-  try
-	try
-	  Writeln(1 div GetZero);	// force exception
-	except
-	  raise;
-	end;
-  except
-	on e: Exception do begin
-	  Writeln(e.Message, ': Exception "', e.ClassName, '" at');
-	  Writeln(e.StackTrace);
-	end;
-  end;
-*)
-
   TestDelpiException;
+
   Writeln('~~~~~~~~~~~~');
+
+  // verifying DLL unload detection: load and unload a DLL *not* currently loaded by the process:
+  hMod := Windows.LoadLibrary('hid.dll');
+  Assert(hMod <> 0);
+  Windows.FreeLibrary(hMod);
+
+  Writeln('~~~~~~~~~~~~');
+
   TestOsException;
 end;
 
@@ -175,8 +209,6 @@ end;
 
 
 begin
-  StdLib.ExecApp('map2pdb.exe SimpleTest.map', true, true, 5000);
-
   Test1;
 
   Readln;
